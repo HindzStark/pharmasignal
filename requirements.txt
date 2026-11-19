@@ -1,0 +1,10 @@
+# Local orchestration (extract -> upload -> Glue -> Athena) and dashboard
+requests>=2.32
+boto3[crt]>=1.40          # crt: needed for credentials from `aws login`
+pandas>=2.2
+streamlit>=1.50
+
+# Tests: the Glue transform logic runs on a local SparkSession (needs Java 17).
+# Pinned to the Spark version of AWS Glue 6.0; Glue itself provides PySpark at runtime.
+pyspark==4.1.1
+pytest>=8

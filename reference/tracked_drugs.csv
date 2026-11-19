@@ -1,0 +1,7 @@
+generic_name,brand_name,company,therapy_area,is_msd
+PEMBROLIZUMAB,Keytruda,MSD,Oncology,true
+NIVOLUMAB,Opdivo,BMS,Oncology,false
+ATEZOLIZUMAB,Tecentriq,Roche,Oncology,false
+SITAGLIPTIN,Januvia,MSD,Diabetes,true
+LINAGLIPTIN,Tradjenta,Boehringer Ingelheim,Diabetes,false
+SAXAGLIPTIN,Onglyza,AstraZeneca,Diabetes,false

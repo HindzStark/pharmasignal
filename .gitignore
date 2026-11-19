@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated data (re-created by the pipeline)
+data/raw/
+*.duckdb
+*.duckdb.wal
+_state.json
+
+# tool artifacts
+target/
+logs/
+.user.yml
+
+# build output
+build/
+
+# local Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# never commit credentials
+.aws/
+.env
+*.pem
+credentials
+
