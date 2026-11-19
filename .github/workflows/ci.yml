@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"          # Glue 6.0 runs Spark 4.1.1 on Java 17
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"      # same Python as Glue 6.0
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Unit + data-quality tests (local SparkSession, synthetic fixtures, no network / no AWS)
+        run: python -m pytest -v
+      - name: Glue job script compiles
+        run: python -m py_compile glue/jobs/transform_faers.py
