@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PharmaSignal ETL - S3 data lake (bronze / silver / curated), Glue 6.0 Spark job with data-quality
+  gate and job bookmarks, Glue Data Catalog database, Athena workgroup with a per-query scan limit,
+  and a weekly Glue trigger (created DISABLED so it costs nothing).
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique name for the data-lake bucket.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  DatabaseName:
+    Type: String
+    Default: pharmasignal
+  GlueVersion:
+    Type: String
+    Default: "6.0"
+    AllowedValues: ["6.0", "5.1", "5.0"]
+  AthenaBytesScannedCutoff:
+    Type: Number
+    Default: 1073741824   # 1 GB per query (Athena bills $5/TB scanned, so <= $0.005 per query)
+    MinValue: 10000000
+  BronzeRetentionDays:
+    Type: Number
+    Default: 90
+
+Resources:
+  # ------------------------------------------------------------------ storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}   # SSE-S3: no KMS request charges
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-bronze
+            Status: Enabled
+            Prefix: bronze/
+            ExpirationInDays: !Ref BronzeRetentionDays
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+          - Id: expire-glue-temp
+            Status: Enabled
+            Prefix: tmp/
+            ExpirationInDays: 7
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt DataBucket.Arn, !Sub "${DataBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  # ------------------------------------------------------------------ IAM (least privilege)
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${DatabaseName}-glue-job-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition: {StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}}
+      Policies:
+        - PolicyName: pharmasignal-glue-job
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt DataBucket.Arn
+              - Sid: ReadInputs
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${DataBucket.Arn}/code/*"
+                  - !Sub "${DataBucket.Arn}/reference/*"
+                  - !Sub "${DataBucket.Arn}/bronze/*"
+                  - !Sub "${DataBucket.Arn}/silver/*"
+                  - !Sub "${DataBucket.Arn}/curated/*"
+                  - !Sub "${DataBucket.Arn}/tmp/*"
+              - Sid: WriteOutputs
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub "${DataBucket.Arn}/silver/*"
+                  - !Sub "${DataBucket.Arn}/curated/*"
+                  - !Sub "${DataBucket.Arn}/tmp/*"
+              - Sid: CatalogTables
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetPartitions
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
+              - Sid: JobLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+              - Sid: JobMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition: {StringEquals: {"cloudwatch:namespace": "Glue"}}
+
+  # ------------------------------------------------------------------ catalog + job
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: PharmaSignal curated FAERS tables (Parquet on S3), registered by the Glue job.
+
+  TransformJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${DatabaseName}-transform"
+      Description: Bronze JSON -> flatten/dedupe -> star schema + signal marts -> DQ gate -> Parquet + Catalog.
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 15
+      MaxRetries: 0
+      ExecutionClass: STANDARD
+      ExecutionProperty: {MaxConcurrentRuns: 1}
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataBucket}/code/transform_faers.py"
+      DefaultArguments:
+        "--job-language": python
+        "--job-bookmark-option": job-bookmark-enable
+        "--extra-py-files": !Sub "s3://${DataBucket}/code/etl.zip"
+        "--TempDir": !Sub "s3://${DataBucket}/tmp/"
+        "--BUCKET": !Ref DataBucket
+        "--DATABASE": !Ref DatabaseName
+        "--enable-metrics": "false"
+        "--enable-spark-ui": "false"
+
+  WeeklyTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub "${DatabaseName}-weekly"
+      Description: Weekly re-run of the transform (Mondays 02:30 UTC). Created disabled; activate with start-trigger.
+      Type: SCHEDULED
+      Schedule: cron(30 2 ? * MON *)
+      StartOnCreation: false
+      Actions:
+        - JobName: !Ref TransformJob
+
+  # ------------------------------------------------------------------ query
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref DatabaseName
+      Description: PharmaSignal queries (results expire after 7 days; per-query scan limit enforced).
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        BytesScannedCutoffPerQuery: !Ref AthenaBytesScannedCutoff
+        EngineVersion: {SelectedEngineVersion: AUTO}
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+          EncryptionConfiguration: {EncryptionOption: SSE_S3}
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  GlueJobName:
+    Value: !Ref TransformJob
+  GlueDatabase:
+    Value: !Ref DatabaseName
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup
+  WeeklyTriggerName:
+    Value: !Ref WeeklyTrigger
+  GlueJobRoleArn:
+    Value: !GetAtt GlueJobRole.Arn
