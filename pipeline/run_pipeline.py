@@ -3,6 +3,7 @@
 Usage:
     python -m pipeline.run_pipeline                 # full run
     python -m pipeline.run_pipeline --skip-extract  # reuse local bronze files, don't call openFDA
+    python -m pipeline.run_pipeline --validate-only # only the Athena validation queries
 
 Fails fast: a failed Glue run (including a failed data-quality check) exits non-zero with a link to
 its CloudWatch logs; the previously published tables stay untouched.
